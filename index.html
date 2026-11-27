@@ -11,6 +11,9 @@
   
   <!-- 引入 Lucide Icons -->
   <script src="https://unpkg.com/lucide@latest"></script>
+  
+  <!-- 引入 localForage (用於 GitHub Pages 備用本地儲存) -->
+  <script src="https://cdnjs.cloudflare.com/ajax/libs/localforage/1.10.0/localforage.min.js"></script>
 
   <style>
     /* 列印專用 CSS，隱藏無關 UI 並調整列印邊距 */
@@ -259,23 +262,35 @@
 
     // Firebase 設置
     const appId = typeof __app_id !== 'undefined' ? __app_id : 'efl-quiz-gen';
-    const firebaseConfig = typeof __firebase_config !== 'undefined' ? JSON.parse(__firebase_config) : {};
     
     let app, db, auth, userId;
-    try {
-      app = initializeApp(firebaseConfig);
-      db = getFirestore(app);
-      auth = getAuth(app);
-    } catch(e) {
-      console.error(e);
-    }
+    let isCloud = false;
 
     let vocabBank = [];
     let currentQuiz = [];
     let uploadedImageUrl = '';
     let isAdmin = false;
 
-    // --- Firebase Auth & 載入資料 ---
+    // 檢查是否有雲端環境設定 (例如在上傳 GitHub 時會是 undefined)
+    if (typeof __firebase_config !== 'undefined') {
+      try {
+        isCloud = true;
+        const firebaseConfig = JSON.parse(__firebase_config);
+        app = initializeApp(firebaseConfig);
+        db = getFirestore(app);
+        auth = getAuth(app);
+        initFirebase();
+      } catch(e) {
+        console.error("Firebase 初始化失敗，將自動切換為本地儲存", e);
+        isCloud = false;
+        initLocalDB();
+      }
+    } else {
+      isCloud = false;
+      initLocalDB();
+    }
+
+    // --- Firebase Auth & 載入資料 (雲端模式) ---
     async function initFirebase() {
       try {
         if (typeof __initial_auth_token !== 'undefined') {
@@ -284,13 +299,13 @@
           await signInAnonymously(auth);
         }
         userId = auth.currentUser?.uid;
-        loadVocabularies();
+        loadVocabulariesCloud();
       } catch (error) {
         console.error("認證失敗", error);
       }
     }
 
-    function loadVocabularies() {
+    function loadVocabulariesCloud() {
       if (!userId) return;
       const colRef = collection(db, 'artifacts', appId, 'users', userId, 'vocabBank');
       
@@ -312,9 +327,20 @@
       });
     }
 
-    // 啟動 Firebase
-    if (app) {
-      initFirebase();
+    // --- 本地端 IndexedDB 載入資料 (GitHub 備用模式) ---
+    async function initLocalDB() {
+      localforage.config({ name: 'EFL_Quiz_Gen', storeName: 'vocab_bank' });
+      try {
+        const data = await localforage.getItem('vocabBank');
+        vocabBank = data || [];
+        // 依照加入時間排序 (新的在前面)
+        vocabBank.sort((a, b) => b.id - a.id);
+        updateFiltersDropdown();
+        renderAdminTable();
+        generateQuiz();
+      } catch (err) {
+        console.error("讀取本地資料庫失敗", err);
+      }
     }
 
     // --- 輔助函式：UI 與提示 ---
@@ -451,13 +477,23 @@
       });
     }
 
-    // 刪除單字 (連動 Firestore)
+    // 刪除單字 (連動 Firestore 或 本地資料庫)
     async function deleteVocab(id) {
-      if (!userId || !db) return;
       try {
-        const docRef = doc(db, 'artifacts', appId, 'users', userId, 'vocabBank', id.toString());
-        await deleteDoc(docRef);
-        showToast("已從雲端圖庫刪除該單字");
+        if (isCloud) {
+          if (!userId || !db) return;
+          const docRef = doc(db, 'artifacts', appId, 'users', userId, 'vocabBank', id.toString());
+          await deleteDoc(docRef);
+          showToast("已從雲端圖庫刪除該單字");
+        } else {
+          // 本地刪除邏輯
+          vocabBank = vocabBank.filter(v => v.id.toString() !== id.toString());
+          await localforage.setItem('vocabBank', vocabBank);
+          updateFiltersDropdown();
+          renderAdminTable();
+          generateQuiz();
+          showToast("已從本地圖庫刪除該單字");
+        }
       } catch (err) {
         console.error("刪除失敗", err);
         showToast("刪除失敗");
@@ -644,7 +680,7 @@
       }
     });
 
-    // 新增單字表單提交 (存入 Firestore)
+    // 新增單字表單提交 (存入 Firestore 或 本地資料庫)
     document.getElementById('add-vocab-form').addEventListener('submit', async function(e) {
       e.preventDefault();
       const grade = document.getElementById('input-grade').value;
@@ -654,11 +690,6 @@
 
       if (!uploadedImageUrl || !unit || !word) {
         showToast("請完整上傳圖片、填寫單元與單字！");
-        return;
-      }
-
-      if (!userId || !db) {
-        showToast("系統連線中，請稍候再試。");
         return;
       }
 
@@ -672,19 +703,34 @@
       };
 
       try {
-        const docRef = doc(collection(db, 'artifacts', appId, 'users', userId, 'vocabBank'), newItem.id);
-        await setDoc(docRef, newItem);
-        
+        if (isCloud) {
+          if (!userId || !db) {
+            showToast("系統連線中，請稍候再試。");
+            return;
+          }
+          const docRef = doc(collection(db, 'artifacts', appId, 'users', userId, 'vocabBank'), newItem.id);
+          await setDoc(docRef, newItem);
+          showToast("單字新增並成功備份至雲端！", true);
+        } else {
+          // 本地新增邏輯
+          vocabBank.push(newItem);
+          vocabBank.sort((a, b) => b.id - a.id);
+          await localforage.setItem('vocabBank', vocabBank);
+          updateFiltersDropdown();
+          renderAdminTable();
+          generateQuiz();
+          showToast("單字新增成功！(已安全儲存於您的瀏覽器中)", true);
+        }
+
         // 重設表單
         this.reset();
         uploadedImageUrl = '';
         document.getElementById('image-preview-container').classList.add('hidden');
         document.getElementById('image-preview').src = '';
         
-        showToast("單字新增並成功備份至雲端！", true);
       } catch (err) {
         console.error("儲存失敗", err);
-        showToast("新增失敗，請檢查網路連線。");
+        showToast("新增失敗，請檢查系統連線狀態。");
       }
     });
 
